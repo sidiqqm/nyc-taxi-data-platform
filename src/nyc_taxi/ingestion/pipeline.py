@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from nyc_taxi.common.config import Settings, SourceConfig
+from nyc_taxi.ingestion.gcs import GcsUploader, UploadError
 from nyc_taxi.ingestion.http_client import DownloadError, RemoteInfo, SourceClient
 from nyc_taxi.ingestion.manifest import RunLog, read_sidecar, utc_now_iso, write_sidecar
 from nyc_taxi.ingestion.months import split_period
@@ -20,10 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 class Outcome(StrEnum):
-    DOWNLOADED = "downloaded"  # new file
-    REPLACED = "replaced"  # source changed (or --force): file overwritten
-    SKIPPED = "skipped_unchanged"  # already ingested, source unchanged
-    NOT_AVAILABLE = "not_available"  # source does not have the file (yet)
+    DOWNLOADED = "downloaded"
+    REPLACED = "replaced"
+    SKIPPED = "skipped_unchanged"
+    UPLOADED = "uploaded_from_local"  # upload-only mode: local already present
+    NOT_AVAILABLE = "not_available"
     FAILED = "failed"
 
 
@@ -38,6 +40,7 @@ class IngestResult:
     schema_changed: bool = False
     dry_run: bool = False
     duration_seconds: float = 0.0
+    uploaded: bool = False
 
     def as_event(self, run_id: str, source_url: str) -> dict:
         return {
@@ -53,18 +56,11 @@ class IngestResult:
             "schema_changed": self.schema_changed,
             "dry_run": self.dry_run,
             "duration_seconds": round(self.duration_seconds, 3),
+            "uploaded": self.uploaded,
         }
 
 
 def bronze_path(bronze_dir: Path, source: SourceConfig, period: str | None) -> Path:
-    """Where a file lives in Bronze. The same relative path will be the object key in GCS.
-
-    monthly:   <root>/yellow/year=2025/month=01/yellow_tripdata_2025-01.parquet
-    reference: <root>/reference/taxi_zone_lookup/taxi_zone_lookup.csv
-
-    The path never contains the ingestion date: re-running must hit the same path (idempotency).
-    The ingestion time is recorded in the sidecar instead.
-    """
     file_name = source.url_for(period).rsplit("/", 1)[-1]
     if source.kind == "monthly":
         year, month = split_period(period)
@@ -73,7 +69,6 @@ def bronze_path(bronze_dir: Path, source: SourceConfig, period: str | None) -> P
 
 
 def _source_changed(remote: RemoteInfo, meta: dict) -> bool:
-    """True if any version signal the source provides differs from what we recorded."""
     signals = [
         ("etag", remote.etag),
         ("last_modified", remote.last_modified),
@@ -86,12 +81,29 @@ def _source_changed(remote: RemoteInfo, meta: dict) -> bool:
 
 
 def decide(remote: RemoteInfo, meta: dict | None, file_exists: bool, force: bool) -> Outcome:
-    """Pure decision for a file the source has (HTTP 200). Easy to test: no I/O."""
     if meta is None or not file_exists:
         return Outcome.DOWNLOADED
     if force or _source_changed(remote, meta):
         return Outcome.REPLACED
     return Outcome.SKIPPED
+
+
+def _upload_target(
+    uploader: GcsUploader | None,
+    target: Path,
+    bronze_dir: Path,
+    *,
+    force: bool,
+) -> str | None:
+    """Upload target to GCS; return an error message if it failed, else None."""
+    if uploader is None:
+        return None
+    relative_key = target.relative_to(bronze_dir).as_posix()
+    try:
+        uploader.upload_with_sidecar(target, relative_key, force=force)
+    except UploadError as exc:
+        return str(exc)
+    return None
 
 
 def _ingest(
@@ -100,6 +112,8 @@ def _ingest(
     *,
     settings: Settings,
     client: SourceClient,
+    uploader: GcsUploader | None,
+    upload_force: bool,
     run_id: str,
     force: bool,
     dry_run: bool,
@@ -119,6 +133,14 @@ def _ingest(
     meta = read_sidecar(target)
     outcome = decide(remote, meta, target.exists(), force)
     if outcome is Outcome.SKIPPED:
+        if dry_run or uploader is None:
+            return result(outcome, "already ingested and source unchanged")
+        # Only reach GCS if the operator asked for a forced re-upload.
+        if upload_force:
+            err = _upload_target(uploader, target, settings.bronze_dir, force=True)
+            if err is not None:
+                return result(Outcome.FAILED, f"force upload failed: {err}")
+            return result(outcome, "already ingested; re-uploaded to GCS", uploaded=True)
         return result(outcome, "already ingested and source unchanged")
     if dry_run:
         return result(outcome, "dry run: nothing written")
@@ -128,7 +150,7 @@ def _ingest(
     try:
         download = client.download(url, part)
         facts = validate(part, source.file_format, source.required_columns)
-        os.replace(part, target)  # atomic: Bronze never shows a half-written file
+        os.replace(part, target)
     finally:
         part.unlink(missing_ok=True)
 
@@ -157,11 +179,23 @@ def _ingest(
     schema_changed = bool(meta) and meta.get("schema_fingerprint") != facts.schema_fingerprint
     if schema_changed:
         logger.warning("%s %s: schema changed compared with the previous copy", source.name, period)
+
+    upload_err = _upload_target(uploader, target, settings.bronze_dir, force=upload_force)
+    if upload_err is not None:
+        return result(
+            Outcome.FAILED,
+            f"local file is good but upload failed: {upload_err}",
+            size_bytes=download.size_bytes,
+            rows=facts.rows,
+            schema_changed=schema_changed,
+        )
+
     return result(
         outcome,
         size_bytes=download.size_bytes,
         rows=facts.rows,
         schema_changed=schema_changed,
+        uploaded=uploader is not None,
     )
 
 
@@ -172,11 +206,12 @@ def ingest_one(
     settings: Settings,
     client: SourceClient,
     run_log: RunLog,
+    uploader: GcsUploader | None = None,
+    upload_force: bool = False,
     run_id: str,
     force: bool = False,
     dry_run: bool = False,
 ) -> IngestResult:
-    """Ingest one file. Never raises: every outcome, including failure, becomes a result."""
     started = time.monotonic()
     try:
         outcome = _ingest(
@@ -184,13 +219,15 @@ def ingest_one(
             period,
             settings=settings,
             client=client,
+            uploader=uploader,
+            upload_force=upload_force,
             run_id=run_id,
             force=force,
             dry_run=dry_run,
         )
     except (DownloadError, ValidationError, OSError) as exc:
         outcome = IngestResult(source.name, period, Outcome.FAILED, str(exc), dry_run=dry_run)
-    except Exception as exc:  # a bug must not stop the other months; keep the traceback
+    except Exception as exc:
         logger.exception("unexpected error while ingesting %s %s", source.name, period)
         outcome = IngestResult(
             source.name,
@@ -201,7 +238,7 @@ def ingest_one(
         )
 
     outcome.duration_seconds = time.monotonic() - started
-    if not dry_run:  # a dry run must leave no trace in Bronze, not even a log file
+    if not dry_run:
         run_log.append(outcome.as_event(run_id, source.url_for(period)))
     level = logging.ERROR if outcome.outcome is Outcome.FAILED else logging.INFO
     logger.log(
@@ -223,8 +260,9 @@ def run_ingestion(
     force: bool = False,
     dry_run: bool = False,
     client: SourceClient | None = None,
+    uploader: GcsUploader | None = None,
+    upload_force: bool = False,
 ) -> list[IngestResult]:
-    """Ingest every period of one source. A failure in one period does not stop the others."""
     source = settings.source(source_name)
     run_id = run_id or default_run_id()
     client = client or SourceClient(settings.http)
@@ -235,6 +273,8 @@ def run_ingestion(
             period,
             settings=settings,
             client=client,
+            uploader=uploader,
+            upload_force=upload_force,
             run_log=run_log,
             run_id=run_id,
             force=force,
@@ -242,3 +282,45 @@ def run_ingestion(
         )
         for period in periods
     ]
+
+
+def run_upload_only(
+    settings: Settings,
+    source_name: str,
+    periods: list[str | None],
+    *,
+    uploader: GcsUploader,
+    upload_force: bool = False,
+) -> list[IngestResult]:
+    """Upload files that already exist in local Bronze, without touching the source."""
+    source = settings.source(source_name)
+    results: list[IngestResult] = []
+    for period in periods:
+        target = bronze_path(settings.bronze_dir, source, period)
+        if not target.is_file():
+            results.append(
+                IngestResult(source.name, period, Outcome.NOT_AVAILABLE, "local file not found")
+            )
+            continue
+        meta = read_sidecar(target) or {}
+        try:
+            upload = uploader.upload_with_sidecar(
+                target,
+                target.relative_to(settings.bronze_dir).as_posix(),
+                force=upload_force,
+            )
+        except UploadError as exc:
+            results.append(IngestResult(source.name, period, Outcome.FAILED, str(exc)))
+            continue
+        results.append(
+            IngestResult(
+                source.name,
+                period,
+                Outcome.UPLOADED,
+                upload.reason or "uploaded",
+                size_bytes=meta.get("size_bytes"),
+                rows=meta.get("rows"),
+                uploaded=upload.uploaded,
+            )
+        )
+    return results

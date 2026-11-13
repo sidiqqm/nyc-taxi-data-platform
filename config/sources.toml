@@ -20,3 +20,14 @@ kind = "reference"
 file_format = "csv"
 url_template = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
 required_columns = ["LocationID", "Borough", "Zone", "service_zone"]
+
+[gcs]
+bucket = "nyc-taxi-data-platform-1-nyc-taxi-bronze"
+location = "us-central1"
+
+[project]
+dependencies = [
+    "requests>=2.32",
+    "pyarrow>=15",
+    "google-cloud-storage>=2.18",
+]

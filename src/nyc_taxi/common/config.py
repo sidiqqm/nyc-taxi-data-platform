@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path("../config/sources.toml")
 VALID_KINDS = {"monthly", "reference"}
 VALID_FORMATS = {"parquet", "csv"}
+
+
+def _resolve_default_config_path() -> Path:
+    override = os.environ.get("NYC_TAXI_CONFIG_PATH")
+    if override:
+        return Path(override)
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "config" / "sources.toml"
+        if candidate.is_file():
+            return candidate
+    return Path("config") / "sources.toml"
+
+
+DEFAULT_CONFIG_PATH = _resolve_default_config_path()
 
 
 class ConfigError(ValueError):
@@ -25,10 +39,16 @@ class HttpSettings:
 
 
 @dataclass(frozen=True)
+class GcsSettings:
+    bucket: str
+    location: str = "us-central1"
+
+
+@dataclass(frozen=True)
 class SourceConfig:
     name: str
-    kind: str  # "monthly" (one file per YYYY-MM) or "reference" (one static file)
-    file_format: str  # "parquet" or "csv"
+    kind: str
+    file_format: str
     url_template: str
     required_columns: tuple[str, ...] = ()
 
@@ -40,6 +60,7 @@ class SourceConfig:
 class Settings:
     bronze_dir: Path
     http: HttpSettings = field(default_factory=HttpSettings)
+    gcs: GcsSettings | None = None
     sources: dict[str, SourceConfig] = field(default_factory=dict)
 
     def source(self, name: str) -> SourceConfig:
@@ -91,6 +112,17 @@ def load_settings(path: Path = DEFAULT_CONFIG_PATH) -> Settings:
         ),
         user_agent=http_raw.get("user_agent", defaults.user_agent),
     )
+
+    gcs: GcsSettings | None = None
+    if "gcs" in raw:
+        gcs_raw = raw["gcs"]
+        if "bucket" not in gcs_raw:
+            raise ConfigError("config [gcs] section is missing required key 'bucket'")
+        gcs = GcsSettings(
+            bucket=gcs_raw["bucket"],
+            location=gcs_raw.get("location", "us-central1"),
+        )
+
     sources = {name: _build_source(name, cfg) for name, cfg in raw.get("sources", {}).items()}
     if not sources:
         raise ConfigError(f"config file {path} defines no [sources.*] section")
@@ -98,5 +130,6 @@ def load_settings(path: Path = DEFAULT_CONFIG_PATH) -> Settings:
     return Settings(
         bronze_dir=Path(raw.get("paths", {}).get("bronze_dir", "data/bronze")),
         http=http,
+        gcs=gcs,
         sources=sources,
     )
